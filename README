@@ -1,1 +1,80 @@
-Hello World!
+# wireproto
+
+A custom binary message format shared by the server and the client,
+with forward/backward interoperability between protocol v1 and v2.
+
+## Frame format
+
+```
++--------+--------+---------+=============+=================+
+| magic0 | magic1 | version | body length | fields ...      |
+| 0xC5   | 0xA1   | 1 byte  | uvarint     | body length     |
++--------+--------+---------+=============+=================+
+```
+
+Each field is a TLV triple:
+
+```
+field id  : uvarint, must be > 0
+wire type : 1 byte   (0 = varint, 1 = bytes, 2 = string)
+value     : uvarint                    (wire type 0)
+          | uvarint length + raw bytes (wire types 1 and 2)
+```
+
+Field ids are append-only:
+
+| id | field    | type   | since |
+|----|----------|--------|-------|
+| 1  | ID       | varint | v1    |
+| 2  | Name     | string | v1    |
+| 3  | Priority | varint | v2 (optional, default 1) |
+
+## Root cause of the v1/v2 interop failure
+
+When the server was upgraded to v2 it started appending the new
+optional field `Priority` (id 3) to every frame. Two defects combined
+into the observed "field misalignment + occasional panic" on old
+clients:
+
+1. **Encoder bug (the planted fault):** the encoding branch for the new
+   field wrote a wrong field id / length, so the bytes on the wire did
+   not match the documented TLV layout. Any decoder — old or new — that
+   trusted those bytes lost track of field boundaries and parsed
+   garbage from the middle of the payload.
+2. **Decoder fragility:** the v1 decoder assumed it knew every field in
+   the frame and indexed into the buffer without bounds checks. An
+   unexpected field (or a corrupt length) therefore shifted every
+   subsequent field and, for truncated or hostile input, panicked with
+   a slice-out-of-range instead of returning an error.
+
+## Compatibility strategy
+
+- **TLV with explicit boundaries.** Every field carries its id, wire
+  type, and (for byte payloads) its length, so a decoder can always
+  find the next field boundary without understanding the field.
+- **Skip-and-preserve unknown fields.** Decoders accept frames from any
+  known peer version. Fields with unrecognized ids are skipped via
+  their TLV boundary and retained in `Message.Unknown`, so a v1 client
+  correctly recovers `ID`/`Name` from a v2 frame and can forward the
+  unknown field untouched.
+- **Defaults for absent optional fields.** A v2 decoder reading a v1
+  frame fills the missing optional field with its documented default
+  (`DefaultPriority = 1`).
+- **Frozen v1 layout.** Existing field ids, wire types, and byte layout
+  never change. Golden sample frames under `testdata/v1/` (constructed
+  by hand, independently of the encoder) regress any accidental change
+  to the v1 byte format.
+- **Frame body length.** The header carries the exact body length, so
+  truncation at any byte offset — even exactly at a field boundary —
+  is detectable and returns `ErrTruncated`/`ErrTrailing`.
+- **Fail, never panic.** All decoding goes through a bounds-checked
+  reader. Truncation, length overrun, over-long varints (> 10 bytes),
+  field id 0, and unknown wire types all return typed errors.
+
+## Development
+
+```
+make test     # unit + interop + malformed + golden tests
+make interop  # v1<->v2 matrix and golden-sample regression only
+make fuzz     # 100k random inputs (no panic) + 15s go-fuzz session
+```
