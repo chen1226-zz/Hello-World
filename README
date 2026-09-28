@@ -1,1 +1,82 @@
-Hello World!
+# pager：并发写入下不漏不重的游标分页（Go 1.22，仅标准库）
+
+按「更新时间倒序 + id 倒序」做游标分页。翻页会话内读取同一快照，
+因此后台持续插入/更新/删除时，客户端逐页拉取的拼接结果恰好等于
+会话开始时刻的快照：零重复、零遗漏。
+
+## 运行
+
+```sh
+make test       # 单元测试（重复排序键、边界插入/删除、游标篡改/过期等）
+make page-test  # 并发翻页实验：-race 下重复 1000 次，断言零重复零遗漏
+```
+
+`page-test` 中 4 个 writer goroutine 持续插入/更新/删除（大量记录共享
+少量时间戳），客户端用游标逐页拉取，最后把拼接结果与
+`Store.RecordsAt(快照版本)` 逐条比对。可用 `PAGE_TEST_RUNS=N` 调整次数。
+
+## 原实现为什么会漏/重
+
+三种典型缺陷，在「单次查询正确、翻页过程有并发写入」时暴露：
+
+1. **只用时间做单字段游标**（`WHERE updated_at < :cursor`）
+   排序键不唯一时，游标无法区分「同一时刻内的不同记录」。一页恰好
+   截断在一组相同 `updated_at` 中间时，下一页的 `<` 条件会把该时刻
+   剩余记录整组跳过（漏数据）；若边界写成 `<=` 则把上一页末条再取
+   一次（重复）。相同更新时间的记录越多，触发概率越高。
+   修复：复合游标 `(updated_at, id)`，用 `id` 做决胜键，比较条件是
+   字典序 `(updated_at, id) < (:t, :id)`，每个排序键唯一。
+
+2. **内部用 offset 分页**（游标里存「第 N 页/偏移量」）
+   offset 是相对位置，并发写入会让它漂移：翻页期间在已翻过的区域
+   插入一条，其后所有记录后移一位，下一页 offset 处重复一条；
+   删除一条则整体前移，下一页跳过一条（漏）。更新 `updated_at`
+   相当于删除+插入，同样触发。
+   修复：游标只引用记录本身的排序键（keyset pagination），
+   与记录的位置无关，插入/删除不影响定位。
+
+3. **边界开闭写反**
+   下一页应从「上一页最后一条之后」开始，即严格大于比较
+   （`>`/`<` 取决于排序方向）。写成 `>=` 会让上一页末条在下一页
+   重复出现；写成「严格大于 + 单字段」则叠加问题 1 整组漏数据。
+   修复：游标指向的记录必须存在于快照中（否则报
+   `ErrCursorMismatch`），下一页从它的**下一条**开始。
+
+即使以上三点都写对，只要每页各自查询实时数据，翻页期间的写入
+仍会让「所有页拼起来」不等于任何一个时刻的真实状态。因此本实现
+再加一层保证：
+
+4. **快照隔离（MVCC）**：`FirstPage` 时固定一个存储版本，整个翻页
+   会话的所有页都读该版本的快照。插入/删除落在当前页边界、删除
+   上一页游标指向的记录，都不影响进行中的会话；新一轮翻页自然
+   看到最新数据。
+
+## 设计要点
+
+- **复合游标**：负载为 `(快照版本, updated_at, id)`，HMAC-SHA256
+  签名后 base64 编码。任何字节被篡改（含跨 Pager 实例混用）都报
+  `ErrCursorTampered`。
+- **游标过期**：翻页会话有 TTL（默认 10 分钟，`WithCursorTTL` 可调），
+  超时未使用的游标报 `ErrCursorExpired`；过期会话的快照引用被释放，
+  存储随之回收历史版本。
+- **MVCC 存储**：每次 `Put`/`Delete` 版本号 +1，历史版本保留到不再
+  被任何快照引用后压缩回收（保留每个被引用版本的可见项 + 全局最新项）。
+- **定位**：快照切片按 `(UpdatedAt, ID)` 倒序，用二分查找定位游标
+  记录，下一页从其下一条开始；游标记录不存在时报 `ErrCursorMismatch`。
+
+## API
+
+```go
+store := pager.NewStore()
+store.Put(pager.Record{ID: 1, UpdatedAt: time.Now(), Value: "..."})
+p := pager.NewPager(store) // 可选 WithCursorTTL / WithCursorSecret
+
+page, _ := p.FirstPage(50)
+for page.HasMore {
+    page, _ = p.NextPage(page.NextCursor, 50)
+}
+// page.Version 标识本页所属快照版本；同一会话所有页相同。
+```
+
+错误：`ErrInvalidLimit`、`ErrCursorTampered`、`ErrCursorExpired`、
+`ErrCursorMismatch`、`ErrInvalidVersion`（均可用 `errors.Is` 判断）。
