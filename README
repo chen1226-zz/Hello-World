@@ -1,1 +1,78 @@
-Hello World!
+# apiclient — 安全的 HTTPS 客户端
+
+调用外部 HTTPS 服务的 Go 客户端（仅标准库，Go 1.22+），默认执行严格的
+TLS 证书校验：证书链、主机名（SAN）、有效期全部校验，最低 TLS 1.2，
+仅启用强密码套件。
+
+## 原配置的风险（已修复）
+
+修复前的客户端配置等价于：
+
+```go
+&tls.Config{
+    InsecureSkipVerify: true, // 跳过证书链与主机名校验
+    VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+        return nil // 恒返回 nil：任何证书都“合法”
+    },
+}
+```
+
+`InsecureSkipVerify: true` 加上恒返回 `nil` 的 `VerifyPeerCertificate`
+回调，意味着客户端会接受**任何**证书——自签、过期、域名不匹配、甚至
+攻击者临时生成的证书。处于网络路径上的中间人（恶意 Wi-Fi、被入侵的
+代理、ARP/DNS 劫持）可以用自己的证书替换服务端证书，**解密、读取并
+篡改全部流量**，包括请求中的认证凭据。这等同于明文传输。
+
+## 正确做法
+
+### 公网服务：使用系统根证书（默认）
+
+```go
+client, err := apiclient.NewClient(apiclient.Config{})
+```
+
+不要设置 `InsecureSkipVerify`，也不要自定义 `VerifyPeerCertificate` /
+`VerifyConnection` 回调。Go 默认即完成证书链、主机名与有效期校验。
+
+### 内部自签 / 私有 CA：注入自定义 CA，而不是跳过校验
+
+把签发内部证书的内部 CA（PEM 格式）加入信任根，校验逻辑保持不变：
+
+```go
+caPEM, _ := os.ReadFile("internal-ca.pem")
+client, err := apiclient.NewClient(apiclient.Config{
+    CustomCAPEM: caPEM, // 在系统根证书之上追加内部 CA
+})
+```
+
+也可以用 `Config.RootCAs` 完全替换根证书池（与 `CustomCAPEM` 互斥）：
+
+```go
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(caPEM)
+client, err := apiclient.NewClient(apiclient.Config{RootCAs: pool})
+```
+
+注意：注入的是 **CA 证书**，服务端证书仍需由该 CA 签发、在有效期内、
+且 SAN 与访问的主机名匹配——校验一点都不少。
+
+## 安全基线
+
+- 最低 TLS 版本：1.2（`MinVersion: tls.VersionTLS12`）
+- TLS 1.2 仅启用 ECDHE + AES-GCM / ChaCha20-Poly1305 密码套件
+- 不使用 `InsecureSkipVerify`，不使用恒放行的校验回调
+
+## 安全回归测试
+
+```sh
+make sec-test
+```
+
+测试在运行时生成测试 CA 与证书，覆盖：
+
+- 自签证书 → 必须失败（`x509.UnknownAuthorityError`）
+- 已过期证书 → 必须失败（`x509.CertificateInvalidError/Expired`）
+- 域名不匹配证书 → 必须失败（`x509.HostnameError`）
+- 正常证书（可信链 + 主机名匹配 + 有效期内）→ 成功
+- 注入自定义 CA 的内部证书 → 成功（不注入则失败）
+- TLS < 1.2 握手 → 必须失败
